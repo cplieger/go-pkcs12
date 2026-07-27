@@ -95,6 +95,21 @@ type pbeParams struct {
 	Iterations int
 }
 
+// maxKDFIterations is the largest KDF iteration count this package will use,
+// whether it came from a file or from a caller.  A count costs time linear in
+// its value while the file carrying it stays the same size, so an unbounded
+// count lets a small file dictate arbitrary CPU.  The limit matches the JDK's
+// PKCS12KeyStore.MAX_ITERATION_COUNT, and is above the highest iteration count
+// OWASP recommends for PBKDF2 (1,400,000, for HMAC-SHA1).
+const maxKDFIterations = 5000000
+
+func checkIterations(iterations int) error {
+	if iterations > maxKDFIterations {
+		return fmt.Errorf("pkcs12: KDF iteration count %d is too large (maximum %d)", iterations, maxKDFIterations)
+	}
+	return nil
+}
+
 func pbeCipherFor(algorithm pkix.AlgorithmIdentifier, password []byte) (cipher.Block, []byte, error) {
 	var cipherType pbeCipher
 
@@ -122,6 +137,9 @@ func pbeCipherFor(algorithm pkix.AlgorithmIdentifier, password []byte) (cipher.B
 
 	var params pbeParams
 	if err := unmarshal(algorithm.Parameters.FullBytes, &params); err != nil {
+		return nil, nil, err
+	}
+	if err := checkIterations(params.Iterations); err != nil {
 		return nil, nil, err
 	}
 
@@ -221,6 +239,9 @@ func pbes2CipherFor(algorithm pkix.AlgorithmIdentifier, password []byte) (cipher
 	}
 	if kdfParams.Salt.Tag != asn1.TagOctetString {
 		return nil, nil, NotImplementedError("only octet string salts are supported for pbes2/pbkdf2")
+	}
+	if err := checkIterations(kdfParams.Iterations); err != nil {
+		return nil, nil, err
 	}
 
 	var prf func() hash.Hash

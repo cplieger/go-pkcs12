@@ -282,3 +282,58 @@ func TestPBMAC1ShortKeyAuthenticationBypass(t *testing.T) {
 		t.Fatalf("expected the short-key check to reject the file, got a different error: %v", err)
 	}
 }
+
+// A file's macData carries its own iteration count, on both the original
+// PKCS#12 MAC path and the PBMAC1 one.  Make sure a huge count is refused
+// before any key is derived.
+func TestDoMacRejectsLargeIterations(t *testing.T) {
+	message := []byte{11, 12, 13, 14, 15}
+	password, err := bmpStringZeroTerminated("test-password")
+	if err != nil {
+		t.Fatalf("Failed to encode password to BMP string: %v", err)
+	}
+
+	const iterations = maxKDFIterations + 1
+	wantErr := fmt.Sprintf("pkcs12: KDF iteration count %d is too large (maximum %d)", iterations, maxKDFIterations)
+
+	// The original PKCS#12 MAC, whose count is macData.Iterations.
+	legacy := &macData{
+		Mac:        digestInfo{Algorithm: pkix.AlgorithmIdentifier{Algorithm: oidSHA256}},
+		MacSalt:    []byte{1, 2, 3, 4, 5, 6, 7, 8},
+		Iterations: iterations,
+	}
+	if _, err := doMac(legacy, message, password); err == nil || err.Error() != wantErr {
+		t.Errorf("legacy MAC: got error %v, want %q", err, wantErr)
+	}
+
+	// PBMAC1, whose count lives in the PBKDF2 parameters.
+	kdfParams := pbkdf2Params{
+		Salt:       asn1.RawValue{Tag: asn1.TagOctetString, Bytes: []byte{1, 2, 3, 4, 5, 6, 7, 8}},
+		Iterations: iterations,
+		KeyLength:  32,
+		Prf:        pkix.AlgorithmIdentifier{Algorithm: oidHmacWithSHA256},
+	}
+	kdfParamsBytes, err := asn1.Marshal(kdfParams)
+	if err != nil {
+		t.Fatalf("Failed to marshal KDF params: %v", err)
+	}
+	params := pbmac1Params{
+		Kdf:    pkix.AlgorithmIdentifier{Algorithm: oidPBKDF2, Parameters: asn1.RawValue{FullBytes: kdfParamsBytes}},
+		MacAlg: pkix.AlgorithmIdentifier{Algorithm: oidHmacWithSHA256},
+	}
+	paramsBytes, err := asn1.Marshal(params)
+	if err != nil {
+		t.Fatalf("Failed to marshal PBMAC1 params: %v", err)
+	}
+	pbmac1 := &macData{
+		Mac: digestInfo{
+			Algorithm: pkix.AlgorithmIdentifier{
+				Algorithm:  oidPBMAC1,
+				Parameters: asn1.RawValue{FullBytes: paramsBytes},
+			},
+		},
+	}
+	if _, err := doMac(pbmac1, message, password); err == nil || err.Error() != wantErr {
+		t.Errorf("PBMAC1: got error %v, want %q", err, wantErr)
+	}
+}

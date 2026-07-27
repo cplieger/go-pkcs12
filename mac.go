@@ -137,6 +137,10 @@ func doPBMAC1(algorithm pkix.AlgorithmIdentifier, message, password []byte) ([]b
 	}
 	keyLen := kdfParams.KeyLength
 
+	if err := checkIterations(kdfParams.Iterations); err != nil {
+		return nil, err
+	}
+
 	// Derive key using PBKDF2
 	key := pbkdf2.Key(password, kdfParams.Salt.Bytes, kdfParams.Iterations, keyLen, prf)
 
@@ -158,6 +162,10 @@ func doMac(macData *macData, message, password []byte) ([]byte, error) {
 		}
 		utf8Password := []byte(originalPassword)
 		return doPBMAC1(macData.Mac.Algorithm, message, utf8Password)
+	}
+
+	if err := checkIterations(macData.Iterations); err != nil {
+		return nil, err
 	}
 
 	var hFn func() hash.Hash

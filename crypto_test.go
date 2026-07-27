@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"fmt"
 	"testing"
 )
 
@@ -279,4 +280,119 @@ func (params pbeParams) RawASN1() (raw asn1.RawValue) {
 		panic(err)
 	}
 	return
+}
+
+// pbes2AlgorithmWithIterations builds a PBES2 (PBKDF2-HMAC-SHA256 + AES-256-CBC)
+// AlgorithmIdentifier whose KDF requests the given iteration count.
+func pbes2AlgorithmWithIterations(t *testing.T, iterations int) pkix.AlgorithmIdentifier {
+	t.Helper()
+
+	var kdfparams pbkdf2Params
+	saltBytes, err := asn1.Marshal([]byte("salt-salt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	kdfparams.Salt.FullBytes = saltBytes
+	kdfparams.Iterations = iterations
+	kdfparams.Prf.Algorithm = oidHmacWithSHA256
+
+	var params pbes2Params
+	params.Kdf.Algorithm = oidPBKDF2
+	if params.Kdf.Parameters.FullBytes, err = asn1.Marshal(kdfparams); err != nil {
+		t.Fatal(err)
+	}
+	params.EncryptionScheme.Algorithm = oidAES256CBC
+	if params.EncryptionScheme.Parameters.FullBytes, err = asn1.Marshal(make([]byte, 16)); err != nil {
+		t.Fatal(err)
+	}
+
+	alg := pkix.AlgorithmIdentifier{Algorithm: oidPBES2}
+	if alg.Parameters.FullBytes, err = asn1.Marshal(params); err != nil {
+		t.Fatal(err)
+	}
+	return alg
+}
+
+// A count at the maximum is accepted and one above it is not.
+func TestCheckIterations(t *testing.T) {
+	for _, iterations := range []int{1, 2048, 1400000, maxKDFIterations - 1, maxKDFIterations} {
+		if err := checkIterations(iterations); err != nil {
+			t.Errorf("iterations=%d: unexpected error %v", iterations, err)
+		}
+	}
+
+	for _, iterations := range []int{maxKDFIterations + 1, 1 << 30} {
+		wantErr := fmt.Sprintf("pkcs12: KDF iteration count %d is too large (maximum %d)", iterations, maxKDFIterations)
+		if err := checkIterations(iterations); err == nil || err.Error() != wantErr {
+			t.Errorf("iterations=%d: got error %v, want %q", iterations, err, wantErr)
+		}
+	}
+}
+
+// A file's KDF can request an unbounded iteration count, and the cost is linear
+// in it while the file stays the same size.  Make sure a huge count is refused
+// before any key is derived, on both the PBES2 and the original PBE path.
+func TestPbDecryptRejectsLargeIterations(t *testing.T) {
+	password, err := bmpStringZeroTerminated("")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const iterations = maxKDFIterations + 1
+	wantErr := fmt.Sprintf("pkcs12: KDF iteration count %d is too large (maximum %d)", iterations, maxKDFIterations)
+
+	td := testDecryptable{
+		data:      make([]byte, 16),
+		algorithm: pbes2AlgorithmWithIterations(t, iterations),
+	}
+	if _, err := pbDecrypt(&td, password); err == nil || err.Error() != wantErr {
+		t.Errorf("pbes2: got error %v, want %q", err, wantErr)
+	}
+
+	pbeAlg := pkix.AlgorithmIdentifier{
+		Algorithm:  oidPBEWithSHAAnd3KeyTripleDESCBC,
+		Parameters: pbeParams{Salt: []byte("salt-salt"), Iterations: iterations}.RawASN1(),
+	}
+	td = testDecryptable{data: make([]byte, 8), algorithm: pbeAlg}
+	if _, err := pbDecrypt(&td, password); err == nil || err.Error() != wantErr {
+		t.Errorf("pbe: got error %v, want %q", err, wantErr)
+	}
+}
+
+// Ensure a PKCS#12 file whose KDF requests a huge iteration count is rejected.
+func TestDecodeTrustStoreLargeIterations(t *testing.T) {
+	var ed encryptedData
+	ed.Version = 0
+	ed.EncryptedContentInfo.ContentType = oidDataContentType
+	ed.EncryptedContentInfo.ContentEncryptionAlgorithm = pbes2AlgorithmWithIterations(t, maxKDFIterations+1)
+	ed.EncryptedContentInfo.EncryptedContent = make([]byte, 16)
+
+	var ci contentInfo
+	ci.ContentType = oidEncryptedDataContentType
+	ci.Content.Class = 2
+	ci.Content.Tag = 0
+	ci.Content.IsCompound = true
+	ci.Content.Bytes, _ = asn1.Marshal(ed)
+
+	authenticatedSafeBytes, _ := asn1.Marshal([]contentInfo{ci})
+
+	var pfx pfxPdu
+	pfx.Version = 3
+	pfx.AuthSafe.ContentType = oidDataContentType
+	pfx.AuthSafe.Content.Class = 2
+	pfx.AuthSafe.Content.Tag = 0
+	pfx.AuthSafe.Content.IsCompound = true
+	pfx.AuthSafe.Content.Bytes, _ = asn1.Marshal(authenticatedSafeBytes)
+
+	pfxData, err := asn1.Marshal(pfx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert the iteration error specifically: decoding this file fails on padding
+	// even without the check, which would make a bare "expected an error" vacuous.
+	wantErr := fmt.Sprintf("pkcs12: KDF iteration count %d is too large (maximum %d)", maxKDFIterations+1, maxKDFIterations)
+	if _, err := DecodeTrustStore(pfxData, ""); err == nil || err.Error() != wantErr {
+		t.Errorf("got error %v, want %q", err, wantErr)
+	}
 }
